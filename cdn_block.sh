@@ -22,6 +22,10 @@ TRAFFIC_LIMIT_GB=200
 TRAFFIC_LIMIT_BYTES=$((TRAFFIC_LIMIT_GB * 1073741824))  # 200GB in bytes
 CRON_TAG="cdn-block-traffic"
 
+# 白名单相关
+WHITELIST_IPSET="cdn_whitelist"
+WHITELIST_FILE="${TRAFFIC_DIR}/whitelist.conf"  # 复用 TRAFFIC_DIR
+
 # ============================================================
 # 内嵌 CDN IPv4 列表
 # ============================================================
@@ -600,6 +604,9 @@ load_ipv4_rules() {
     if ! iptables -C OUTPUT -m set --match-set "$IPSET_NAME_V4" dst -j DROP 2>/dev/null; then
         iptables -I OUTPUT -m set --match-set "$IPSET_NAME_V4" dst -j DROP
     fi
+
+    # 加载白名单规则（必须在 DROP 之后插入，因为 -I 插入到最前面，所以后插入的在前）
+    load_whitelist
 }
 
 # 加载 IPv6 规则
@@ -634,6 +641,9 @@ load_ipv6_rules() {
 
 # 卸载 IPv4 规则
 unload_ipv4_rules() {
+    # 卸载白名单规则
+    unload_whitelist
+
     # 删除 iptables 规则
     # 加载时 INPUT 匹配 src，OUTPUT 匹配 dst，卸载时需精确对应
     if iptables -C INPUT -m set --match-set "$IPSET_NAME_V4" src -j DROP 2>/dev/null; then
@@ -862,11 +872,18 @@ do_show_ips() {
             fi
         )
     fi
-    # 内容较多时使用 less 分页，否则直接输出
+    # 内容较多时提示用户并使用 more/less 分页
     local line_count
     line_count=$(echo "$output" | wc -l)
-    if [[ $line_count -gt 50 ]] && command -v less &>/dev/null; then
-        echo "$output" | less
+    if [[ $line_count -gt 50 ]]; then
+        msg_info "共 ${line_count} 行，按 q 退出查看、空格翻页、上下键滚动"
+        if command -v less &>/dev/null; then
+            echo "$output" | less -R
+        elif command -v more &>/dev/null; then
+            echo "$output" | more
+        else
+            echo "$output"
+        fi
     else
         echo "$output"
     fi
@@ -1500,7 +1517,7 @@ do_test_block() {
 
     echo -e "  ${BOLD}测试方式:${NC} 尝试向 CDN IP 发起连接，超时 3 秒则视为屏蔽生效"
     echo ""
-    printf "  ${CYAN}%-14s %-18s %-10s %s${NC}\n" "CDN 提供商" "测试 IP" "类型" "结果"
+    printf "  ${CYAN}%-16s%-20s%-12s%s${NC}\n" "CDN提供商" "测试IP" "类型" "结果"
     echo "  ────────────────────────────────────────────────────────"
 
     local total_tests=0
@@ -1520,7 +1537,7 @@ do_test_block() {
                 ping_result="${GREEN}✔ 已屏蔽${NC}"
                 blocked_count=$((blocked_count + 1))
             fi
-            printf "  %-14s %-18s %-10s %b\n" "$cdn_name" "$test_ip" "Ping" "$ping_result"
+            printf "  %-16s%-20s%-12s%b\n" "$cdn_name" "$test_ip" "Ping" "$ping_result"
         done
     done
 
@@ -1544,7 +1561,7 @@ do_test_block() {
             http_result="${GREEN}✔ 已屏蔽${NC}"
             blocked_count=$((blocked_count + 1))
         fi
-        printf "  %-14s %-18s %-10s %b\n" "$cdn_name" "$url" "HTTP" "$http_result"
+        printf "  %-16s%-20s%-12s%b\n" "$cdn_name" "$url" "HTTP" "$http_result"
     done
 
     # 汇总
@@ -1582,6 +1599,221 @@ do_test_block() {
     fi
 
     press_enter
+}
+
+# ============================================================
+# 白名单管理
+# ============================================================
+
+# 加载白名单规则
+load_whitelist() {
+    _ensure_traffic_dir  # 白名单配置存储在同一目录
+
+    # 创建或清空 ipset
+    if ipset list -n 2>/dev/null | grep -qw "$WHITELIST_IPSET"; then
+        ipset flush "$WHITELIST_IPSET"
+    else
+        ipset create "$WHITELIST_IPSET" hash:net
+    fi
+
+    # 从配置文件加载
+    if [[ -f "$WHITELIST_FILE" ]]; then
+        local count=0
+        while IFS= read -r entry; do
+            entry=$(echo "$entry" | tr -d '\r' | xargs)
+            [[ -z "$entry" || "$entry" == \#* ]] && continue
+
+            # 判断是 IP/CIDR 还是域名
+            if [[ "$entry" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+                # IPv4 地址或 CIDR
+                ipset add "$WHITELIST_IPSET" "$entry" -exist 2>/dev/null
+                count=$((count + 1))
+            else
+                # 域名，解析为 IP
+                local ips
+                ips=$(dig +short A "$entry" 2>/dev/null | grep -E '^[0-9]+\.' || \
+                      getent ahosts "$entry" 2>/dev/null | awk '{print $1}' | grep -E '^[0-9]+\.' | sort -u)
+                for ip in $ips; do
+                    ipset add "$WHITELIST_IPSET" "$ip" -exist 2>/dev/null
+                    count=$((count + 1))
+                done
+            fi
+        done < "$WHITELIST_FILE"
+    fi
+
+    # 添加 iptables ACCEPT 规则（-I 插入到最前面，优先于 DROP）
+    if ipset list "$WHITELIST_IPSET" 2>/dev/null | sed -n '/^Members:/,$p' | tail -n +2 | grep -q .; then
+        if ! iptables -C INPUT -m set --match-set "$WHITELIST_IPSET" src -j ACCEPT 2>/dev/null; then
+            iptables -I INPUT -m set --match-set "$WHITELIST_IPSET" src -j ACCEPT
+        fi
+        if ! iptables -C OUTPUT -m set --match-set "$WHITELIST_IPSET" dst -j ACCEPT 2>/dev/null; then
+            iptables -I OUTPUT -m set --match-set "$WHITELIST_IPSET" dst -j ACCEPT
+        fi
+    fi
+}
+
+# 卸载白名单规则
+unload_whitelist() {
+    if iptables -C INPUT -m set --match-set "$WHITELIST_IPSET" src -j ACCEPT 2>/dev/null; then
+        iptables -D INPUT -m set --match-set "$WHITELIST_IPSET" src -j ACCEPT
+    fi
+    if iptables -C OUTPUT -m set --match-set "$WHITELIST_IPSET" dst -j ACCEPT 2>/dev/null; then
+        iptables -D OUTPUT -m set --match-set "$WHITELIST_IPSET" dst -j ACCEPT
+    fi
+    if ipset list -n 2>/dev/null | grep -qw "$WHITELIST_IPSET"; then
+        ipset flush "$WHITELIST_IPSET"
+        ipset destroy "$WHITELIST_IPSET"
+    fi
+}
+
+# 13. 白名单管理菜单
+do_whitelist() {
+    while true; do
+        echo ""
+        echo -e "${BOLD}========== 白名单管理 ==========${NC}"
+        echo -e "  白名单中的 IP/域名将被允许通行，不受 CDN 屏蔽影响"
+        echo ""
+
+        # 显示当前白名单
+        echo -e "  ${BOLD}── 当前白名单 ──${NC}"
+        if [[ -f "$WHITELIST_FILE" ]] && [[ -s "$WHITELIST_FILE" ]]; then
+            local idx=1
+            while IFS= read -r entry; do
+                entry=$(echo "$entry" | tr -d '\r' | xargs)
+                [[ -z "$entry" || "$entry" == \#* ]] && continue
+                echo -e "  ${CYAN}${idx})${NC} $entry"
+                idx=$((idx + 1))
+            done < "$WHITELIST_FILE"
+        else
+            echo "  (白名单为空)"
+        fi
+
+        # 显示当前生效的白名单 IP
+        if ipset list -n 2>/dev/null | grep -qw "$WHITELIST_IPSET"; then
+            local wl_count
+            wl_count=$(ipset list "$WHITELIST_IPSET" 2>/dev/null | sed -n '/^Members:/,$p' | tail -n +2 | grep -c . || echo "0")
+            echo ""
+            echo -e "  当前生效 IP 数: ${GREEN}${wl_count}${NC}"
+        fi
+
+        echo ""
+        echo -e "  ${BOLD}── 操作 ──${NC}"
+        echo "  1) 添加 IP 或域名"
+        echo "  2) 删除指定条目"
+        echo "  3) 查看当前生效的白名单 IP"
+        echo "  4) 重新加载白名单"
+        echo "  0) 返回主菜单"
+        echo ""
+        read -rp "  请选择 [0-4]: " wl_choice
+
+        case "$wl_choice" in
+            1)
+                echo ""
+                echo -e "  支持格式: IP地址、CIDR网段、域名"
+                echo -e "  示例: ${CYAN}1.2.3.4${NC}  ${CYAN}10.0.0.0/8${NC}  ${CYAN}example.com${NC}"
+                echo ""
+                read -rp "  请输入要放行的 IP 或域名: " new_entry
+                new_entry=$(echo "$new_entry" | tr -d '\r' | xargs)
+                if [[ -z "$new_entry" ]]; then
+                    msg_err "输入不能为空"
+                    continue
+                fi
+                _ensure_traffic_dir
+                # 检查是否已存在
+                if [[ -f "$WHITELIST_FILE" ]] && grep -qxF "$new_entry" "$WHITELIST_FILE" 2>/dev/null; then
+                    msg_warn "该条目已存在: $new_entry"
+                    continue
+                fi
+                echo "$new_entry" >> "$WHITELIST_FILE"
+                msg_ok "已添加: $new_entry"
+
+                # 如果屏蔽已启用，立即生效
+                if is_rules_active; then
+                    _whitelist_add_entry "$new_entry"
+                    msg_ok "已立即生效"
+                else
+                    msg_info "屏蔽启用后自动生效"
+                fi
+                ;;
+            2)
+                echo ""
+                if [[ ! -f "$WHITELIST_FILE" ]] || [[ ! -s "$WHITELIST_FILE" ]]; then
+                    msg_err "白名单为空"
+                    continue
+                fi
+                # 构建索引列表
+                local -a entries=()
+                while IFS= read -r entry; do
+                    entry=$(echo "$entry" | tr -d '\r' | xargs)
+                    [[ -z "$entry" || "$entry" == \#* ]] && continue
+                    entries+=("$entry")
+                done < "$WHITELIST_FILE"
+                if [[ ${#entries[@]} -eq 0 ]]; then
+                    msg_err "白名单为空"
+                    continue
+                fi
+                read -rp "  输入要删除的序号: " del_idx
+                del_idx=$(echo "$del_idx" | tr -d '\r' | xargs)
+                if ! [[ "$del_idx" =~ ^[0-9]+$ ]] || [[ $del_idx -lt 1 ]] || [[ $del_idx -gt ${#entries[@]} ]]; then
+                    msg_err "无效序号"
+                    continue
+                fi
+                local del_entry="${entries[$((del_idx - 1))]}"
+                # 从文件中移除
+                grep -vxF "$del_entry" "$WHITELIST_FILE" > "${WHITELIST_FILE}.tmp" 2>/dev/null
+                mv "${WHITELIST_FILE}.tmp" "$WHITELIST_FILE"
+                msg_ok "已删除: $del_entry"
+                # 如果屏蔽已启用，重新加载白名单
+                if is_rules_active; then
+                    load_whitelist
+                    msg_ok "白名单已重新加载"
+                fi
+                ;;
+            3)
+                echo ""
+                if ipset list -n 2>/dev/null | grep -qw "$WHITELIST_IPSET"; then
+                    echo -e "  ${BOLD}--- 生效中的白名单 IP ---${NC}"
+                    ipset list "$WHITELIST_IPSET" 2>/dev/null | sed -n '/^Members:/,$p' | tail -n +2
+                    if ! ipset list "$WHITELIST_IPSET" 2>/dev/null | sed -n '/^Members:/,$p' | tail -n +2 | grep -q .; then
+                        echo "  (空)"
+                    fi
+                else
+                    echo "  白名单 ipset 未创建（屏蔽未启用）"
+                fi
+                press_enter
+                ;;
+            4)
+                echo ""
+                if is_rules_active; then
+                    load_whitelist
+                    msg_ok "白名单已重新加载"
+                else
+                    msg_warn "屏蔽未启用，启用后白名单自动生效"
+                fi
+                press_enter
+                ;;
+            0) return ;;
+            *) msg_err "无效选择" ;;
+        esac
+    done
+}
+
+# 单条白名单条目加入 ipset
+_whitelist_add_entry() {
+    local entry="$1"
+    if ! ipset list -n 2>/dev/null | grep -qw "$WHITELIST_IPSET"; then
+        return
+    fi
+    if [[ "$entry" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        ipset add "$WHITELIST_IPSET" "$entry" -exist 2>/dev/null
+    else
+        local ips
+        ips=$(dig +short A "$entry" 2>/dev/null | grep -E '^[0-9]+\.' || \
+              getent ahosts "$entry" 2>/dev/null | awk '{print $1}' | grep -E '^[0-9]+\.' | sort -u)
+        for ip in $ips; do
+            ipset add "$WHITELIST_IPSET" "$ip" -exist 2>/dev/null
+        done
+    fi
 }
 
 # ============================================================
@@ -1666,6 +1898,7 @@ main_menu() {
         echo -e "  ${BOLD}── IP 管理 ──${NC}"
         echo "  7) 添加自定义 IP 段"
         echo "  8) 删除指定 IP 段"
+        echo " 13) 白名单放行管理"
         echo ""
         echo -e "  ${BOLD}── 流量监控 ──${NC}"
         echo " 11) 流量记录"
@@ -1681,7 +1914,7 @@ main_menu() {
         echo ""
         echo -e "  ${BOLD}==============================${NC}"
         echo ""
-        read -rp "  请选择 [0-12]: " choice
+        read -rp "  请选择 [0-13]: " choice
 
         case "$choice" in
             1)  do_temp_enable ;;
@@ -1696,6 +1929,7 @@ main_menu() {
             10) do_uninstall ;;
             11) do_traffic_history ;;
             12) do_test_block ;;
+            13) do_whitelist ;;
             0)
                 echo ""
                 msg_info "再见！"
